@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Terminal</title>
+<style>
+  body { margin: 0; padding: 14px; background: #050505; color: #33ff66;
+         font: 14px ui-monospace, Menlo, Consolas, monospace; }
+  #out { display: inline; white-space: pre-wrap; }
+  .cur { display: inline-block; width: 8px; height: 15px; background: #33ff66;
+         vertical-align: text-bottom; animation: b 1s steps(2) infinite; }
+  @keyframes b { 50% { opacity: 0; } }
+</style></head>
+<body>
+<span id="out"></span><span class="cur"></span>
+<script>
+  const out = document.getElementById('out');
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  let queue = Promise.resolve();
+
+  ghost.onSay(lines => {
+    queue = queue.then(async () => {
+      for (const line of lines) {
+        for (const ch of line) { out.textContent += ch; await wait(40 + Math.random() * 80); }
+        out.textContent += '\n';
+        await wait(900);
+      }
+    });
+  });
+</script>
+</body></html>
