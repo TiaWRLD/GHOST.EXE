@@ -1,57 +1,67 @@
 <!doctype html>
 <html><head><meta charset="utf-8">
-<style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
-  #files { position: absolute; top: 50px; display: flex; flex-direction: column; gap: 18px; }
-  .file { width: 90px; text-align: center; color: #fff; cursor: default;
-          font: 12px -apple-system, "Segoe UI", sans-serif; text-shadow: 0 1px 3px #000; }
-  .file .ico { font-size: 46px; }
-  #shot { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
-</style></head>
+    <style>
+        html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+
+        /* #stage centra, #files è l'elemento che trema: così lo shake non rompe la centratura */
+        #stage { position: fixed; inset: 0; display: flex;
+            align-items: center; justify-content: center; }
+        #files { display: flex; gap: 40px; }
+
+        .file { width: 360px; text-align: center; color: #fff; cursor: default;
+            font: 600 34px -apple-system, "Segoe UI", sans-serif;
+            text-shadow: 0 2px 6px #000; }
+        .file .ico { font-size: 200px; line-height: 1.1;
+            filter: drop-shadow(0 0 24px rgba(255, 40, 40, 0.55)); }
+
+        #shot { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
+    </style></head>
 <body>
-<div id="files"></div>
+<div id="stage"><div id="files"></div></div>
 <img id="shot">
 <script>
-  const files = document.getElementById('files');
-  const shot = document.getElementById('shot');
+    const files = document.getElementById('files');
+    const shot = document.getElementById('shot');
 
-  // Le icone vere stanno a destra su Mac, a sinistra su Windows/Linux
-  if (ghost.platform === 'darwin') files.style.right = '30px'; else files.style.left = '30px';
-
-  function jitter(el, intensity, duration, done) {
-    const start = performance.now();
-    (function frame(now) {
-      const k = 1 - (now - start) / duration;
-      if (k <= 0) { el.style.transform = ''; el.style.filter = ''; return done && done(); }
-      const x = (Math.random() - 0.5) * 2 * intensity * k;
-      const y = (Math.random() - 0.5) * 2 * intensity * k;
-      el.style.transform = `translate(${x}px, ${y}px) scale(1.03)`;
-      el.style.filter = Math.random() < 0.04 ? 'invert(1)' : '';   // lampo ogni tanto
-      requestAnimationFrame(frame);
-    })(start);
-  }
-
-  ghost.onShake(({ img, intensity, duration }) => {
-    if (img) {
-      shot.src = img;
-      shot.decode().then(() => {
-        shot.style.display = 'block';
-        jitter(shot, intensity, duration, () => shot.style.display = 'none');
-      });
-    } else {
-      jitter(files, intensity * 2, duration);   // ripiego se manca il permesso
+    function jitter(el, intensity, duration, done) {
+        const start = performance.now();
+        (function frame(now) {
+            const k = 1 - (now - start) / duration;
+            if (k <= 0) { el.style.transform = ''; el.style.filter = ''; return done && done(); }
+            const x = (Math.random() - 0.5) * 2 * intensity * k;
+            const y = (Math.random() - 0.5) * 2 * intensity * k;
+            el.style.transform = `translate(${x}px, ${y}px) scale(1.03)`;
+            el.style.filter = Math.random() < 0.04 ? 'invert(1)' : '';   // occasional flash
+            requestAnimationFrame(frame);
+        })(start);
     }
-  });
 
-  ghost.onSpawnFile(({ name, icon }) => {
-    const el = document.createElement('div');
-    el.className = 'file';
-    el.innerHTML = `<div class="ico">${icon}</div><div>${name}</div>`;
-    // l'overlay è click-through, tranne quando il mouse è sopra un file
-    el.addEventListener('mouseenter', () => ghost.setClickable(true));
-    el.addEventListener('mouseleave', () => ghost.setClickable(false));
-    el.addEventListener('dblclick', () => { ghost.setClickable(false); ghost.fileOpened(name); });
-    files.appendChild(el);
-  });
+    ghost.onShake(({ img, intensity, duration }) => {
+        if (img) {
+            shot.src = img;
+            shot.decode().then(() => {
+                shot.style.display = 'block';
+                jitter(shot, intensity, duration, () => shot.style.display = 'none');
+            });
+        } else {
+            jitter(files, intensity * 2, duration);   // fallback if screen permission is missing
+        }
+    });
+
+    ghost.onSpawnFile(({ name, icon }) => {
+        const el = document.createElement('div');
+        el.className = 'file';
+        el.innerHTML = `<div class="ico">${icon}</div><div>${name}</div>`;
+        // the overlay is click-through, except while the mouse is over a file
+        el.addEventListener('mouseenter', () => ghost.setClickable(true));
+        el.addEventListener('mouseleave', () => ghost.setClickable(false));
+        el.addEventListener('dblclick', () => { ghost.setClickable(false); ghost.fileOpened(name); });
+        files.appendChild(el);
+    });
+
+    ghost.onRemoveFile(() => {
+        const last = files.lastElementChild;
+        if (last) jitter(last, 14, 500, () => last.remove());   // shake, then vanish
+    });
 </script>
 </body></html>
