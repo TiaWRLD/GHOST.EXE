@@ -23,6 +23,377 @@
     const files = document.getElementById('files');
     const shot = document.getElementById('shot');
 
+    // ---------- Audio (all synthesized, no audio files) ----------
+    const MASTER = 0.8;
+    let actx, master, droneGain, droneFilter, noiseBuf, reverbSend;
+    let beatTimer = null, beatBpm = 0, heartGain = null, silenceTimer = null;
+
+    // Tuning knobs. Level 0 = off, 5 = maximum.
+    const DRONE_GAIN   = [0, 0.05, 0.09, 0.14, 0.20, 0.26];
+    const DRONE_CUTOFF = [100, 160, 220, 300, 420, 600];     // Hz: higher = brighter, harsher
+    const HEART_BPM    = [0, 54, 66, 80, 98, 118];
+    const HEART_VOL    = [0, 0.30, 0.40, 0.55, 0.70, 0.85];
+    const WHISPER_VOL  = 0.45;
+    const BREATH_VOL   = 0.7;
+
+    function initAudio() {
+        actx = new AudioContext();
+
+        // master -> compressor -> speakers (the compressor stops stacked sounds from clipping)
+        master = actx.createGain();
+        master.gain.value = MASTER;
+        const comp = actx.createDynamicsCompressor();
+        comp.threshold.value = -18;
+        comp.ratio.value = 6;
+        master.connect(comp).connect(actx.destination);
+
+        // 2 seconds of white noise, reused by whispers, clicks and thuds
+        noiseBuf = actx.createBuffer(1, actx.sampleRate * 2, actx.sampleRate);
+        const data = noiseBuf.getChannelData(0);
+        for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+
+        // Small reverb from a decaying-noise impulse response.
+        // Whispers and breaths go through it so they sound like they are "in the room".
+        const reverb = actx.createConvolver();
+        const irLen = Math.floor(actx.sampleRate * 2.2);
+        const ir = actx.createBuffer(2, irLen, actx.sampleRate);
+        for (let c = 0; c < 2; c++) {
+            const d = ir.getChannelData(c);
+            for (let i = 0; i < irLen; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / irLen, 3);
+        }
+        reverb.buffer = ir;
+        reverbSend = actx.createGain();
+        const reverbOut = actx.createGain();
+        reverbOut.gain.value = 0.5;
+        reverbSend.connect(reverb);
+        reverb.connect(reverbOut).connect(master);
+
+        // Heartbeat bus
+        heartGain = actx.createGain();
+        heartGain.gain.value = 0;
+        heartGain.connect(master);
+
+        // Drone: three slightly detuned oscillators -> slow beating between them
+        droneFilter = actx.createBiquadFilter();
+        droneFilter.type = 'lowpass';
+        droneFilter.frequency.value = DRONE_CUTOFF[0];
+        droneFilter.Q.value = 1.2;
+
+        droneGain = actx.createGain();
+        droneGain.gain.value = 0;
+        droneFilter.connect(droneGain).connect(master);
+
+        [[82.4, 'sawtooth'], [83.2, 'sawtooth'], [164.8, 'sine']].forEach(([freq, type]) => {
+            const o = actx.createOscillator();
+            o.type = type;
+            o.frequency.value = freq;
+            const g = actx.createGain();
+            g.gain.value = type === 'sine' ? 0.5 : 0.35;
+            o.connect(g).connect(droneFilter);
+            o.start();
+        });
+
+        // Slow LFO makes the filter "breathe"
+        const lfo = actx.createOscillator();
+        lfo.frequency.value = 0.07;
+        const lfoDepth = actx.createGain();
+        lfoDepth.gain.value = 50;
+        lfo.connect(lfoDepth).connect(droneFilter.frequency);
+        lfo.start();
+
+        ghost.log('audio state: ' + actx.state);
+        if (actx.state === 'suspended') {
+            actx.resume().then(() => ghost.log('audio state after resume: ' + actx.state));
+        }
+    }
+
+    function noiseSource() {
+        const s = actx.createBufferSource();
+        s.buffer = noiseBuf;
+        s.loop = true;
+        return s;
+    }
+
+    // --- Drone ---
+    function setDrone(level, fadeSeconds = 2) {
+        const l = Math.max(0, Math.min(5, level | 0));
+        const t = actx.currentTime;
+        droneGain.gain.setTargetAtTime(DRONE_GAIN[l], t, fadeSeconds / 3);
+        droneFilter.frequency.setTargetAtTime(DRONE_CUTOFF[l], t, fadeSeconds / 3);
+    }
+
+    // --- Heartbeat: "lub-dub", speeds up with the level ---
+    function thump(freq, vol, t) {
+        // a sine that drops in pitch + a triangle one octave up (so laptop speakers can reproduce it)
+        [[freq, 'sine', 1], [freq * 2, 'triangle', 0.35]].forEach(([f, type, k]) => {
+            const o = actx.createOscillator();
+            o.type = type;
+            o.frequency.setValueAtTime(f, t);
+            o.frequency.exponentialRampToValueAtTime(f * 0.5, t + 0.15);
+            const g = actx.createGain();
+            g.gain.setValueAtTime(0.0001, t);
+            g.gain.linearRampToValueAtTime(vol * k, t + 0.012);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+            o.connect(g).connect(heartGain);
+            o.start(t);
+            o.stop(t + 0.25);
+        });
+    }
+
+    function beatLoop() {
+        if (!beatBpm) return;
+        const period = 60 / beatBpm;
+        const t = actx.currentTime + 0.02;
+        thump(75, 1.0, t);                                    // lub
+        thump(62, 0.65, t + Math.min(0.22, period * 0.4));    // dub
+        beatTimer = setTimeout(beatLoop, period * 1000);
+    }
+
+    function setHeartbeat(level) {
+        const l = Math.max(0, Math.min(5, level | 0));
+        beatBpm = HEART_BPM[l];
+        heartGain.gain.setTargetAtTime(HEART_VOL[l], actx.currentTime, 0.5);
+        clearTimeout(beatTimer);
+        if (beatBpm) beatLoop(); else beatTimer = null;
+    }
+
+    // --- Whisper: aspirated noise shaped by vowel formants, syllable by syllable ---
+    // [F1, F2, F3] in Hz for a few vowels: the mouth's resonances are what makes noise sound like speech
+    const VOWELS = [
+        [730, 1090, 2440],   // a
+        [270, 2290, 3010],   // i
+        [300,  870, 2240],   // u
+        [530, 1840, 2480],   // e
+        [570,  840, 2410]    // o
+    ];
+
+    function whisper() {
+        let t = actx.currentTime + 0.02;
+        const syllables = 4 + Math.floor(Math.random() * 4);
+
+        // random position in the stereo field + a send to the reverb
+        const pan = actx.createStereoPanner();
+        pan.pan.value = (Math.random() * 2 - 1) * 0.7;
+        const out = actx.createGain();
+        out.gain.value = WHISPER_VOL;
+        const send = actx.createGain();
+        send.gain.value = 0.7;
+        out.connect(pan);
+        pan.connect(master);
+        pan.connect(send).connect(reverbSend);
+
+        for (let i = 0; i < syllables; i++) {
+            const v = VOWELS[Math.floor(Math.random() * VOWELS.length)];
+            const dur = 0.09 + Math.random() * 0.14;
+
+            const env = actx.createGain();
+            env.gain.setValueAtTime(0.0001, t);
+            env.gain.exponentialRampToValueAtTime(1, t + dur * 0.35);
+            env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+            env.connect(out);
+
+            // three narrow band-pass filters in parallel = three formants.
+            // The gains are high because narrow filters let very little noise through.
+            const src = noiseSource();
+            [[v[0], 5, 7], [v[1], 6, 5], [v[2], 7, 2.5]].forEach(([f, q, gain]) => {
+                const bp = actx.createBiquadFilter();
+                bp.type = 'bandpass';
+                bp.frequency.value = f * (0.95 + Math.random() * 0.1);
+                bp.Q.value = q;
+                const g = actx.createGain();
+                g.gain.value = gain;
+                src.connect(bp).connect(g).connect(env);
+            });
+            src.start(t, Math.random() * 1.5);
+            src.stop(t + dur + 0.05);
+
+            // on half of the syllables, a short "s/sh" hiss at the start
+            if (Math.random() < 0.5) {
+                const hs = noiseSource();
+                const hp = actx.createBiquadFilter();
+                hp.type = 'highpass';
+                hp.frequency.value = 4500;
+                const hg = actx.createGain();
+                hg.gain.setValueAtTime(0.0001, t);
+                hg.gain.exponentialRampToValueAtTime(0.35, t + 0.03);
+                hg.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+                hs.connect(hp).connect(hg).connect(out);
+                hs.start(t, Math.random() * 1.5);
+                hs.stop(t + 0.12);
+            }
+
+            t += dur + 0.03 + Math.random() * 0.12;   // irregular gap between syllables
+        }
+    }
+
+    // --- Breath: a short inhale, a small pause, a long exhale. Different every time. ---
+    // One half of a breath. 'in' = shorter, thinner, rising. 'out' = longer, lower, louder.
+    function breathPhase(t, dur, peak, kind, dest) {
+        const inhale = kind === 'in';
+
+        // Soft noise: lowpassed so it is not hissy like the raw white noise
+        const src = noiseSource();
+        const soft = actx.createBiquadFilter();
+        soft.type = 'lowpass';
+        soft.frequency.value = inhale ? 4200 : 3200;
+
+        // Two wide resonances, like the "h" of a breathed "ha". Inhale is higher and thinner.
+        const f1 = inhale ? 800 + Math.random() * 200 : 600 + Math.random() * 150;
+        const f2 = inhale ? 1900 + Math.random() * 300 : 1150 + Math.random() * 250;
+        const tone = actx.createGain();
+        [[f1, 1.6, 2.2], [f2, 1.8, 1.4]].forEach(([f, q, gain]) => {
+            const bp = actx.createBiquadFilter();
+            bp.type = 'bandpass';
+            bp.frequency.setValueAtTime(f * (inhale ? 0.85 : 1.1), t);
+            bp.frequency.linearRampToValueAtTime(f * (inhale ? 1.12 : 0.8), t + dur);   // inhale rises, exhale falls
+            bp.Q.value = q;
+            const g = actx.createGain();
+            g.gain.value = gain;
+            soft.connect(bp).connect(g).connect(tone);
+        });
+        src.connect(soft);
+
+        // Airflow flutter: two slow, out-of-sync oscillators make the level wobble irregularly
+        const flutter = actx.createGain();
+        flutter.gain.value = 0.8;
+        [[2.3 + Math.random() * 2, 0.12], [6 + Math.random() * 4, 0.07]].forEach(([rate, depth]) => {
+            const lfo = actx.createOscillator();
+            lfo.frequency.value = rate;
+            const d = actx.createGain();
+            d.gain.value = depth;
+            lfo.connect(d).connect(flutter.gain);
+            lfo.start(t);
+            lfo.stop(t + dur + 0.1);
+        });
+
+        // Envelope: inhale builds slowly then stops; exhale starts fast then trails away
+        const env = actx.createGain();
+        env.gain.setValueAtTime(0.0001, t);
+        if (inhale) {
+            env.gain.exponentialRampToValueAtTime(peak, t + dur * 0.8);
+            env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        } else {
+            env.gain.exponentialRampToValueAtTime(peak, t + dur * 0.18);
+            env.gain.exponentialRampToValueAtTime(peak * 0.35, t + dur * 0.6);
+            env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        }
+
+        tone.connect(flutter).connect(env).connect(dest);
+        src.start(t, Math.random() * 1.5);
+        src.stop(t + dur + 0.1);
+    }
+
+    function breath() {
+        const t = actx.currentTime + 0.02;
+        const inDur  = 0.9 + Math.random() * 0.5;
+        const gap    = 0.15 + Math.random() * 0.25;
+        const outDur = 1.8 + Math.random() * 0.8;
+
+        // random stereo position + reverb send (same idea as the whisper)
+        const pan = actx.createStereoPanner();
+        pan.pan.value = (Math.random() * 2 - 1) * 0.6;
+        const out = actx.createGain();
+        out.gain.value = 1;
+        const send = actx.createGain();
+        send.gain.value = 0.6;
+        out.connect(pan);
+        pan.connect(master);
+        pan.connect(send).connect(reverbSend);
+
+        breathPhase(t, inDur, BREATH_VOL * 0.5, 'in', out);
+        breathPhase(t + inDur + gap, outDur, BREATH_VOL, 'out', out);
+    }
+
+    // --- Glitch: electrical clicks + a short buzz, synced with shakes ---
+    function click(t, vol) {
+        const src = noiseSource();
+        const hp = actx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = 2500 + Math.random() * 3000;
+        const len = 0.01 + Math.random() * 0.03;
+        const g = actx.createGain();
+        g.gain.setValueAtTime(vol, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + len);
+        src.connect(hp).connect(g).connect(master);
+        src.start(t, Math.random());
+        src.stop(t + len + 0.02);
+    }
+
+    function glitch(intensity = 6, duration = 400) {
+        const t = actx.currentTime;
+        const n = 2 + Math.round(intensity / 2);
+        for (let i = 0; i < n; i++) click(t + Math.random() * duration / 1000, 0.25 + Math.random() * 0.25);
+
+        const o = actx.createOscillator();
+        o.type = 'square';
+        o.frequency.value = 100 + Math.random() * 300;
+        const len = Math.min(duration / 1000, 0.25);
+        const g = actx.createGain();
+        g.gain.setValueAtTime(0.05, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + len);
+        o.connect(g).connect(master);
+        o.start(t);
+        o.stop(t + len + 0.02);
+    }
+
+    // --- Thud: the dull impact (climax, strong shakes) ---
+    function thud(vol = 1) {
+        const t = actx.currentTime;
+        [[90, 35, 'sine', 0.9, 0.9], [180, 70, 'triangle', 0.35, 0.4]].forEach(([f0, f1, type, k, len]) => {
+            const o = actx.createOscillator();
+            o.type = type;
+            o.frequency.setValueAtTime(f0, t);
+            o.frequency.exponentialRampToValueAtTime(f1, t + 0.35);
+            const g = actx.createGain();
+            g.gain.setValueAtTime(0.0001, t);
+            g.gain.linearRampToValueAtTime(vol * k, t + 0.005);
+            g.gain.exponentialRampToValueAtTime(0.001, t + len);
+            o.connect(g).connect(master);
+            o.start(t);
+            o.stop(t + len + 0.05);
+        });
+        // a burst of low noise gives it body
+        const src = noiseSource();
+        const lp = actx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = 400;
+        const ng = actx.createGain();
+        ng.gain.setValueAtTime(vol * 0.5, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+        src.connect(lp).connect(ng).connect(master);
+        src.start(t, Math.random());
+        src.stop(t + 0.2);
+    }
+
+    // --- Silence: everything cuts out at once, then (optionally) comes back ---
+    function silence(ms = 2000, restore = true) {
+        clearTimeout(silenceTimer);
+        master.gain.cancelScheduledValues(actx.currentTime);
+        master.gain.setTargetAtTime(0, actx.currentTime, 0.015);
+        if (restore) {
+            silenceTimer = setTimeout(
+                () => master.gain.setTargetAtTime(MASTER, actx.currentTime, 0.05), ms);
+        }
+    }
+
+    // Commands from main: { sound: 'drone' | 'heartbeat' | 'whisper' | 'breath' |
+    //                       'glitch' | 'thud' | 'silence', ...options }
+    ghost.onSound(cmd => {
+        if (!actx) return;
+        switch (cmd.sound) {
+            case 'drone':     setDrone(cmd.level, cmd.fade); break;
+            case 'heartbeat': setHeartbeat(cmd.level); break;
+            case 'whisper':   whisper(); break;
+            case 'breath':    breath(); break;
+            case 'glitch':    glitch(cmd.intensity, cmd.duration); break;
+            case 'thud':      thud(cmd.vol); break;
+            case 'silence':   silence(cmd.ms, cmd.restore !== false); break;
+        }
+    });
+
+    initAudio();
+
+    // ---------- Effects ----------
     function jitter(el, intensity, duration, done) {
         const start = performance.now();
         (function frame(now) {
@@ -37,6 +408,11 @@
     }
 
     ghost.onShake(({ img, intensity, duration }) => {
+        // sound is tied to the shake here, so image and audio can never drift apart
+        if (actx) {
+            glitch(intensity, duration);
+            if (intensity >= 6) thud(Math.min(1, intensity / 12));
+        }
         if (img) {
             shot.src = img;
             shot.decode().then(() => {
@@ -61,7 +437,9 @@
 
     ghost.onRemoveFile(() => {
         const last = files.lastElementChild;
-        if (last) jitter(last, 14, 500, () => last.remove());   // shake, then vanish
-    });
+        if (last) jitter(last, 14, 500, () => {
+            last.remove();
+            ghost.setClickable(false);   // if the cursor was over it, mouseleave never fires: give the desktop its clicks back
+        });    });
 </script>
 </body></html>

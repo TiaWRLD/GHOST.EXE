@@ -20,7 +20,11 @@
     let queue = Promise.resolve();
     let pending = 0;   // spirit messages still being typed
 
-    ghost.onSay(lines => {
+    // payload: an array of lines (old format) or { lines, prompt }.
+    // prompt:false = the input line never comes back after this message (endings)
+    ghost.onSay(payload => {
+        const lines = Array.isArray(payload) ? payload : payload.lines;
+        const showPrompt = Array.isArray(payload) ? true : payload.prompt !== false;
         pending++;
         prompt.style.display = 'none';
         queue = queue.then(async () => {
@@ -30,7 +34,7 @@
                 toBottom();
                 await wait(900);
             }
-            if (--pending === 0) { prompt.style.display = 'flex'; input.focus(); toBottom(); }
+            if (--pending === 0 && showPrompt) { prompt.style.display = 'flex'; input.focus(); toBottom(); }
         });
     });
 
