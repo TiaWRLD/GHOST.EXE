@@ -2,14 +2,32 @@ const { app, BrowserWindow, screen, desktopCapturer, ipcMain,
   globalShortcut, systemPreferences } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { ask, warmup } = require('./llm');
+const { ask, warmup, checkModel, MODEL } = require('./llm');
 const sensors = require('./sensors');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const FILE_NAME = "DON'T OPEN ME";
-const EXTRA_FILES = ['I SEE YOU.txt', 'LOOK BEHIND YOU.txt', 'HELP ME.txt'];
+const EXTRA_ALL = ['I SEE YOU.txt', 'LOOK BEHIND YOU.txt', 'HELP ME.txt'];
+const FOLDER_ALL = ["DON'T LOOK INSIDE", 'MEMORIES'];
+const MAX_ERRORS = 2;        // fake system errors per run
 const TERM_Y_RATIO = 0.04;   // terminal vertical position (0 = top of the work area)
-let overlay, term;
+const EXIT_KEY = 'CommandOrControl+Shift+Q';
+
+// Messages for the fake system error box (the overlay styles it for the current OS)
+const ERROR_POOL = [
+  { text: 'Something else is running on this computer.', code: '0x0000001F' },
+  { text: 'Unable to end process: it is not yours.',     code: '0xC0000142' },
+  { text: 'Access denied. It was here before you.',      code: '0x00000005' }
+];
+
+let overlay, term, warn;
+
+// ---------- Startup state ----------
+let aiStatus = 'checking';   // 'checking' | 'ready' | 'no-model' | 'no-ollama'
+let exitShortcutOK = false;
+let begun = false;           // the user pressed "Begin haunting"
+let aftermath = null;        // marker left by a previous completed ending
+const stats = { ai: 0, fallback: 0 };
 
 // ---------- Phases ----------
 // The interactive phases, in order. After the last one comes the scripted climax.
@@ -32,10 +50,16 @@ let phaseStart = Date.now();
 let phaseTurns = 0;         // user-triggered turns in the current phase
 let lastActivity = Date.now();
 let llmReady = false;
-let extraSpawned = 0;
-let fileCount = 0;          // fake files currently on screen
 let greeted = false;
 let closedReactionDone = false;
+let errorsShown = 0;
+
+// Fake items currently on the desktop, tracked by name
+const fileNames = [];                 // everything on screen, in creation order
+const kinds = new Map();              // name -> 'file' | 'folder'
+const extraPool = [...EXTRA_ALL];     // names still available to spawn
+const folderPool = [...FOLDER_ALL];
+const removable = () => fileNames.filter(n => n !== FILE_NAME);   // the original is never removed
 
 // All spirit actions run one at a time through this queue
 let turnQueue = Promise.resolve();
@@ -49,6 +73,20 @@ function enqueue(job) {
 }
 
 // ---------- Windows ----------
+// The startup warning: a normal window, shown BEFORE anything else happens
+function createWarning() {
+  warn = new BrowserWindow({
+    width: 620, height: 700, center: true,
+    resizable: false, minimizable: false, maximizable: false,
+    title: 'Poltergeist', backgroundColor: '#0b0b0d',
+    webPreferences: { preload: path.join(__dirname, 'preload.js') }
+  });
+  warn.setMenuBarVisibility(false);
+  warn.loadFile('warning.html');
+  // closing the warning without pressing Begin means "no thanks"
+  warn.on('closed', () => { if (!overlay) app.quit(); });
+}
+
 function createOverlay() {
   const { bounds } = screen.getPrimaryDisplay();
   overlay = new BrowserWindow({
@@ -117,15 +155,23 @@ async function say(lines, { prompt = true } = {}) {
   await sleep(lines.join('').length * 90 + lines.length * 900);
 }
 
-// File bookkeeping, so we always know how many fake files are on screen
-function spawnFile(name) {
-  fileCount++;
-  overlay.webContents.send('spawn-file', { name, icon: '📄' });
+// ---------- Fake desktop items ----------
+// icon: 'file' | 'folder' (the overlay draws an OS-flavoured SVG for each)
+function spawnFile(name, icon = 'file', kind = 'file') {
+  fileNames.push(name);
+  kinds.set(name, kind);
+  overlay.webContents.send('spawn-file', { name, icon });
 }
-function removeFile() {
-  if (fileCount <= 0) return;
-  fileCount--;
-  overlay.webContents.send('remove-file');
+
+function removeFile(name) {
+  const i = fileNames.indexOf(name);
+  if (i < 0) return false;
+  fileNames.splice(i, 1);
+  // give the name back so the spirit can recreate it later
+  if (EXTRA_ALL.includes(name)) extraPool.push(name);
+  if (FOLDER_ALL.includes(name)) folderPool.push(name);
+  overlay.webContents.send('remove-file', { name });
+  return true;
 }
 
 // Random background sound, so the room feels alive even when nobody is typing
@@ -135,25 +181,65 @@ function ambient() {
 }
 
 // ---------- The spirit's brain ----------
+// Which actions the spirit may use RIGHT NOW (depends on phase and on what exists on screen)
+function allowedActions() {
+  const a = ['none'];
+  const idx = ORDER.indexOf(phase);
+  if (idx < 0) return a;                       // omen / climax / end: words only
+  a.push('shake');
+  if (extraPool.length) a.push('spawn_file');
+  if (idx >= 1) {                              // conversation and later
+    if (folderPool.length) a.push('spawn_folder');
+    if (fileNames.length) a.push('move_file');
+  }
+  if (idx >= 2) {                              // intrusion only
+    if (removable().length) a.push('remove_file');
+    if (errorsShown < MAX_ERRORS) a.push('fake_error');
+  }
+  return a;
+}
+
+// perform() only checks that the action is physically possible; the limits live in allowedActions()
 async function perform(action) {
-  if (action === 'shake') await shake(8, 450);
-  else if (action === 'spawn_file' && extraSpawned < EXTRA_FILES.length) {
-    spawnFile(EXTRA_FILES[extraSpawned++]);
+  if (action === 'shake') {
+    await shake(8, 450);
+  } else if (action === 'spawn_file' && extraPool.length) {
+    spawnFile(extraPool.shift());
     await sleep(600);
-  } else if (action === 'remove_file' && fileCount > 1) {   // never remove the original file
-    removeFile();
-    extraSpawned = Math.max(0, extraSpawned - 1);           // it can come back later
-    await sleep(700);
+  } else if (action === 'spawn_folder' && folderPool.length) {
+    spawnFile(folderPool.shift(), 'folder', 'folder');
+    await sleep(600);
+  } else if (action === 'move_file' && fileNames.length) {
+    const name = fileNames[Math.floor(Math.random() * fileNames.length)];
+    overlay.webContents.send('move-file', { name });
+    await sleep(1300);                         // shake + vanish + reappear takes about a second
+  } else if (action === 'remove_file') {
+    const r = removable();
+    if (r.length) { removeFile(r[r.length - 1]); await sleep(700); }
+  } else if (action === 'fake_error') {
+    const e = ERROR_POOL[errorsShown % ERROR_POOL.length];
+    errorsShown++;
+    overlay.webContents.send('fake-error', e);
+    await sleep(1500);
+  } else if (action !== 'none') {
+    console.log('[perform] skipped (not possible now):', action);
   }
 }
+
+// Options shared by every call to the model
+const askOptions = () => ({
+  timeoutMs: llmReady ? 8000 : 20000,
+  offline: aiStatus !== 'ready'          // no Ollama or no model: go straight to the pre-written lines
+});
 
 async function spiritTurn(event) {
   memory.push('event: ' + event);
 
   const r = await ask(
-      { phase, event, facts: sensors.read(), memory },
-      { timeoutMs: llmReady ? 8000 : 20000 }
+      { phase, event, facts: sensors.read(), memory, allowed: allowedActions() },
+      askOptions()
   );
+  stats[r.source]++;
   console.log(`[spirit] phase=${phase} source=${r.source}`, r);
 
   memory.push(`you said: "${r.say}"` + (r.action !== 'none' ? ` (and you did: ${r.action})` : ''));
@@ -230,8 +316,8 @@ async function climax() {
   const finalLine = ask(
       { phase: 'climax',
         event: 'this is the end. you are leaving this machine for good. say your last words to the user.',
-        facts: sensors.read(), memory },
-      { timeoutMs: llmReady ? 8000 : 20000 }
+        facts: sensors.read(), memory, allowed: ['none'] },
+      askOptions()
   );
 
   sound('silence', { ms: 2500 });        // the calm before
@@ -247,9 +333,11 @@ async function climax() {
     await sleep(gaps[i]);
   }
 
-  // everything on the desktop disappears, one by one
-  // (600 ms apart: the overlay removes the LAST file, and its shake animation lasts 500 ms)
-  while (fileCount > 0) { removeFile(); await sleep(600); }
+  // everything on the desktop disappears, one by one (removed by name, so moved files are fine too)
+  while (fileNames.length) {
+    removeFile(fileNames[fileNames.length - 1]);
+    await sleep(450);
+  }
   await sleep(500);
 
   // last hit, then total silence cuts its tail
@@ -263,6 +351,7 @@ async function climax() {
   // empty desktop, no sound... then the last words appear on their own
   await sleep(2500);
   const r = await finalLine;
+  stats[r.source]++;
   console.log('[spirit] final line', r);
   memory.push(`your last words were: "${r.say}"`);
   await say([r.say], { prompt: false });
@@ -278,12 +367,13 @@ async function climax() {
 
 // ---------- Director ----------
 function onFileOpened(name) {
-  // Later opens: the spirit reacts to WHICH file was opened
+  // Later opens: the spirit reacts to WHICH file or folder was opened
   if (greeted) {
     if (PHASES[phase]) {
       phaseTurns++;
       lastActivity = Date.now();
-      enqueue(() => spiritTurn(`the user double-clicked the file "${name}"`));
+      const kind = kinds.get(name) || 'file';
+      enqueue(() => spiritTurn(`the user double-clicked the ${kind} "${name}"`));
     }
     return;
   }
@@ -329,9 +419,10 @@ async function showAftermath() {
   await sleep(3000);
 }
 
-async function director(aftermath) {
+async function director(withAftermath, grace) {
+  if (grace) await sleep(grace);                          // time to answer the macOS permission prompts
   sound('drone', { level: 1, fade: 4 });                  // barely audible from the start
-  if (aftermath) await showAftermath();
+  if (withAftermath) await showAftermath();
   await sleep(5000);  await shake(3, 150);   // omen
   await sleep(9000);  sound('drone', { level: 2, fade: 2 });
   await shake(7, 350);
@@ -348,21 +439,64 @@ async function director(aftermath) {
   }
 }
 
+// The user pressed "Begin haunting"
+async function begin() {
+  if (begun) return;
+  begun = true;
+
+  // macOS asks for permissions the first time we capture the screen or read the Desktop.
+  // We trigger those prompts now, while the warning is still on screen, not in the middle of a scare.
+  let grace = 0;
+  if (process.platform === 'darwin') {
+    grace = 4000;
+    if (systemPreferences.getMediaAccessStatus('screen') === 'not-determined') {
+      await grabScreen();
+      grace += 6000;
+    }
+  }
+  sensors.read();
+
+  createOverlay();                       // overlay first, so there is never a moment with no windows
+  if (process.platform === 'darwin') app.dock.hide();
+  if (warn && !warn.isDestroyed()) warn.close();
+  overlay.webContents.once('did-finish-load', () => director(aftermath, grace));
+}
+
 // ---------- IPC ----------
-ipcMain.on('clickable', (_e, v) => overlay.setIgnoreMouseEvents(!v, { forward: true }));
+ipcMain.handle('get-status', () => ({
+  ai: aiStatus,
+  model: MODEL,
+  exit: exitShortcutOK,
+  screen: process.platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : null,
+  session: process.platform === 'linux' ? (process.env.XDG_SESSION_TYPE || null) : null
+}));
+ipcMain.on('begin', () => begin());
+ipcMain.on('quit-app', () => app.quit());
+
+ipcMain.on('clickable', (_e, v) => { if (overlay) overlay.setIgnoreMouseEvents(!v, { forward: true }); });
 ipcMain.on('file-opened', (_e, name) => onFileOpened(String(name)));
 ipcMain.on('log', (_e, msg) => console.log('[overlay]', msg));
 ipcMain.on('user-said', (_e, text) => {
+  // backup emergency exit, in case the global shortcut does not work on this system
+  if (String(text).trim().toLowerCase() === '/exit') { app.quit(); return; }
   if (!PHASES[phase]) return;            // ignore input outside the interactive phases
   phaseTurns++;
   lastActivity = Date.now();
   const clean = String(text).slice(0, 200);
   enqueue(() => spiritTurn(`user typed: "${clean}"`));
 });
+// The fake error box was closed. Only a click on OK (byUser) gets a reaction.
+ipcMain.on('error-dismissed', (_e, byUser) => {
+  if (!byUser || !PHASES[phase]) return;
+  phaseTurns++;
+  lastActivity = Date.now();
+  enqueue(() => spiritTurn('the user clicked OK on the system error box you made appear'));
+});
 
 // ---------- Dev only ----------
 // Cmd/Ctrl+Shift+T : cycle through the sounds
 // Cmd/Ctrl+Shift+N : skip to the next phase (the last skip starts the climax)
+// Cmd/Ctrl+Shift+A : cycle through the actions (bypasses the AI and the phase limits)
 const SOUND_TESTS = [
   ['whisper',           'whisper',   {}],
   ['whisper (again)',   'whisper',   {}],
@@ -378,15 +512,21 @@ const SOUND_TESTS = [
   ['drone level 1',     'drone',     { level: 1, fade: 1 }]
 ];
 let testIndex = 0;
+const DEV_ACTIONS = ['spawn_file', 'spawn_folder', 'move_file', 'fake_error', 'remove_file'];
+let actionIndex = 0;
 
 // ---------- Start ----------
 app.whenReady().then(() => {
-  if (process.platform === 'darwin') app.dock.hide();
-  const aftermath = takeEnding();        // did a previous run end properly?
-  createOverlay();
-  globalShortcut.register('CommandOrControl+Shift+Q', () => app.quit());   // emergency exit
+  aftermath = takeEnding();              // did a previous run end properly?
+
+  // the emergency exit is armed BEFORE anything else, and we check that it really registered
+  globalShortcut.register(EXIT_KEY, () => app.quit());
+  exitShortcutOK = globalShortcut.isRegistered(EXIT_KEY);
+  if (!exitShortcutOK) console.warn('[exit] global shortcut NOT registered. Use /exit in the terminal.');
+
   if (!app.isPackaged) {
     globalShortcut.register('CommandOrControl+Shift+T', () => {
+      if (!overlay) return;
       const [label, name, opts] = SOUND_TESTS[testIndex++ % SOUND_TESTS.length];
       console.log('[sound test]', label);
       sound(name, opts);
@@ -396,10 +536,27 @@ app.whenReady().then(() => {
       console.log('[dev] skipping to the next phase');
       enqueue(nextPhase);
     });
+    globalShortcut.register('CommandOrControl+Shift+A', () => {
+      if (!overlay) return;
+      const a = DEV_ACTIONS[actionIndex++ % DEV_ACTIONS.length];
+      console.log('[dev] action:', a);
+      enqueue(() => perform(a));
+    });
   }
-  warmup().then(ok => { llmReady = ok; });   // load the model while the omens play
+
+  createWarning();
+
+  // while the user reads the warning: is the AI available? if so, load the model right away
+  checkModel().then(status => {
+    aiStatus = status;
+    console.log('[llm] status:', status);
+    if (status === 'ready') warmup().then(ok => { llmReady = ok; });
+  });
+
   setInterval(tick, 1000);
-  overlay.webContents.once('did-finish-load', () => director(aftermath));
 });
 
-app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
+  console.log(`[stats] spirit lines: ai=${stats.ai} fallback=${stats.fallback}`);
+});

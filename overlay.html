@@ -3,25 +3,80 @@
     <style>
         html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
 
-        /* #stage centra, #files è l'elemento che trema: così lo shake non rompe la centratura */
-        #stage { position: fixed; inset: 0; display: flex;
+        /* #world holds everything that shakes. #stage centers the files that sit in the middle;
+           #loose holds files that were moved somewhere else (absolute positions). */
+        #world { position: fixed; inset: 0; }
+        #stage { position: absolute; inset: 0; display: flex;
             align-items: center; justify-content: center; }
         #files { display: flex; gap: 40px; }
+        #loose { position: absolute; inset: 0; pointer-events: none; }
 
         .file { width: 360px; text-align: center; color: #fff; cursor: default;
             font: 600 34px -apple-system, "Segoe UI", sans-serif;
             text-shadow: 0 2px 6px #000; }
-        .file .ico { font-size: 200px; line-height: 1.1;
+        .file .ico { height: 200px; display: flex; align-items: center; justify-content: center;
+            margin-bottom: 8px;
             filter: drop-shadow(0 0 24px rgba(255, 40, 40, 0.55)); }
+        .file .ico svg { width: 200px; height: 200px; }
+        .file.loose { position: absolute; pointer-events: auto; }
 
         #shot { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
+
+        /* ---- Fake system error box (styled per OS in JS) ---- */
+        #err { position: fixed; left: 50%; top: 22%; transform: translateX(-50%);
+            display: none; z-index: 10; user-select: none; }
+        #err .icon { flex: none; }
+        #err .icon svg { display: block; }
+        #err .msg { flex: 1; }
+        #err .code { opacity: .6; font-size: 11px; margin-top: 8px; }
+        #err button { font: inherit; cursor: default; }
+        #err .mt { display: none; }
+
+        #err.win { width: 420px; background: #f0f0f0; color: #000; border: 1px solid #6b6b6b;
+            box-shadow: 0 10px 30px rgba(0,0,0,.5); font: 12px "Segoe UI", sans-serif; }
+        #err.win .bar { background: #fff; padding: 8px 12px; }
+        #err.win .body { display: flex; gap: 14px; padding: 22px 20px; background: #fff; }
+        #err.win .icon svg { width: 32px; height: 32px; }
+        #err.win .foot { background: #f0f0f0; padding: 12px; text-align: right; }
+        #err.win button { min-width: 80px; padding: 4px 12px; background: #e1e1e1; border: 1px solid #adadad; }
+
+        #err.mac { width: 300px; background: rgba(40,40,40,.96); color: #fff; border-radius: 14px;
+            padding: 22px 20px 16px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,.6);
+            font: 13px -apple-system, "SF Pro Text", sans-serif; }
+        #err.mac .bar { display: none; }
+        #err.mac .body { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+        #err.mac .icon svg { width: 56px; height: 56px; }
+        #err.mac .mt { display: block; font-weight: 700; font-size: 14px; }
+        #err.mac .foot { margin-top: 16px; }
+        #err.mac button { width: 100%; padding: 5px 0; background: #0a84ff; color: #fff;
+            border: none; border-radius: 6px; }
+
+        #err.linux { width: 380px; background: #2d2d2d; color: #eee; border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,.6); font: 14px Cantarell, "Ubuntu", sans-serif; }
+        #err.linux .bar { padding: 12px 18px 0; font-weight: 700; }
+        #err.linux .body { display: flex; gap: 14px; padding: 16px 18px; }
+        #err.linux .icon svg { width: 36px; height: 36px; }
+        #err.linux .foot { padding: 0 18px 16px; text-align: right; }
+        #err.linux button { padding: 6px 18px; background: #444; color: #eee; border: none; border-radius: 6px; }
     </style></head>
 <body>
-<div id="stage"><div id="files"></div></div>
+<div id="world">
+    <div id="stage"><div id="files"></div></div>
+    <div id="loose"></div>
+</div>
 <img id="shot">
+<div id="err"></div>
+<script src="icons.js"></script>
 <script>
+    const world = document.getElementById('world');
     const files = document.getElementById('files');
+    const loose = document.getElementById('loose');
     const shot = document.getElementById('shot');
+    const errBox = document.getElementById('err');
+
+    // 'win' | 'mac' | 'linux': picks the look of icons and of the fake error box
+    const OS = ghost.platform === 'win32' ? 'win' : ghost.platform === 'darwin' ? 'mac' : 'linux';
+    Icons.install();
 
     // ---------- Audio (all synthesized, no audio files) ----------
     const MASTER = 0.8;
@@ -420,26 +475,119 @@
                 jitter(shot, intensity, duration, () => shot.style.display = 'none');
             });
         } else {
-            jitter(files, intensity * 2, duration);   // fallback if screen permission is missing
+            jitter(world, intensity * 2, duration);   // fallback if screen permission is missing
         }
     });
 
-    ghost.onSpawnFile(({ name, icon }) => {
+    // ---------- Fake desktop items ----------
+    // icon: 'file' | 'folder' (anything else is drawn as a file)
+    function createFile({ name, icon }) {
         const el = document.createElement('div');
         el.className = 'file';
-        el.innerHTML = `<div class="ico">${icon}</div><div>${name}</div>`;
+        el.dataset.name = name;
+        const ico = document.createElement('div');
+        ico.className = 'ico';
+        // the SVG strings come from icons.js (static, trusted); the name below is set as plain text
+        ico.innerHTML = icon === 'folder' ? Icons.folder(OS) : Icons.file(OS);
+        const label = document.createElement('div');
+        label.textContent = name;
+        el.append(ico, label);
         // the overlay is click-through, except while the mouse is over a file
         el.addEventListener('mouseenter', () => ghost.setClickable(true));
         el.addEventListener('mouseleave', () => ghost.setClickable(false));
         el.addEventListener('dblclick', () => { ghost.setClickable(false); ghost.fileOpened(name); });
-        files.appendChild(el);
+        return el;
+    }
+
+    // Files can be in the centered row (#files) or moved out to #loose
+    function findFile(name) {
+        return [...files.children, ...loose.children].find(e => e.dataset.name === name) || null;
+    }
+
+    ghost.onSpawnFile(d => files.appendChild(createFile(d)));
+
+    ghost.onRemoveFile(d => {
+        const el = d && d.name ? findFile(d.name) : (files.lastElementChild || loose.lastElementChild);
+        if (!el) return;
+        jitter(el, 14, 500, () => {
+            el.remove();
+            // if the cursor was over it, mouseleave never fires: give the desktop its clicks back
+            ghost.setClickable(false);
+        });
     });
 
-    ghost.onRemoveFile(() => {
-        const last = files.lastElementChild;
-        if (last) jitter(last, 14, 500, () => {
-            last.remove();
-            ghost.setClickable(false);   // if the cursor was over it, mouseleave never fires: give the desktop its clicks back
-        });    });
+    // A random spot away from the center of the screen
+    function randomSpot() {
+        const pad = 20, w = 360, h = 290;
+        const maxX = Math.max(pad, innerWidth - w - pad);
+        const left = Math.random() < 0.5
+            ? pad + Math.random() * Math.max(0, Math.min(maxX, innerWidth * 0.22) - pad)
+            : Math.min(maxX, innerWidth * 0.62) + Math.random() * Math.max(0, maxX - innerWidth * 0.62);
+        const top = pad + Math.random() * Math.max(0, innerHeight - h - 2 * pad);
+        return { left, top };
+    }
+
+    // The file shakes, vanishes, and comes back somewhere else
+    ghost.onMoveFile(({ name }) => {
+        const el = findFile(name);
+        if (!el) return;
+        jitter(el, 12, 450, () => {
+            el.style.visibility = 'hidden';
+            ghost.setClickable(false);
+            setTimeout(() => {
+                const { left, top } = randomSpot();
+                if (el.parentElement !== loose) { loose.appendChild(el); el.classList.add('loose'); }
+                el.style.left = left + 'px';
+                el.style.top = top + 'px';
+                el.style.visibility = 'visible';
+                if (actx) glitch(5, 250);
+                jitter(el, 6, 200);
+            }, 500);
+        });
+    });
+
+    // ---------- Fake system error (styled for the current OS) ----------
+    let errTimer = null;
+
+    function hideErr(byUser) {
+        if (errBox.style.display === 'none' || errBox.style.display === '') return;
+        clearTimeout(errTimer);
+        errBox.style.display = 'none';
+        ghost.setClickable(false);
+        ghost.errorDismissed(byUser);
+    }
+
+    function el(tag, cls, text) {
+        const e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text !== undefined) e.textContent = text;
+        return e;
+    }
+
+    ghost.onFakeError(({ text, code }) => {
+        hideErr(false);   // only one box at a time
+        const title = { win: 'System Error', mac: 'System Warning', linux: 'Error' }[OS];
+        const btn   = OS === 'linux' ? 'Close' : 'OK';
+
+        errBox.className = OS;
+        errBox.textContent = '';
+        const msg = el('div', 'msg');
+        msg.append(el('div', 'mt', title), el('div', 't', text), el('div', 'code', 'Error code: ' + code));
+        const icon = el('div', 'icon');
+        icon.innerHTML = Icons.error(OS);          // static SVG from icons.js
+        const body = el('div', 'body');
+        body.append(icon, msg);
+        const button = el('button', '', btn);
+        button.addEventListener('click', () => hideErr(true));
+        const foot = el('div', 'foot');
+        foot.append(button);
+        errBox.append(el('div', 'bar', title), body, foot);
+
+        errBox.addEventListener('mouseenter', () => ghost.setClickable(true));
+        errBox.addEventListener('mouseleave', () => ghost.setClickable(false));
+        errBox.style.display = 'block';          // it just appears: no animation
+        if (actx) { glitch(8, 300); thud(0.5); }
+        errTimer = setTimeout(() => hideErr(false), 14000);
+    });
 </script>
 </body></html>

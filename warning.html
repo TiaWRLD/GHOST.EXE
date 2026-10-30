@@ -1,0 +1,125 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Poltergeist</title>
+    <style>
+        :root { color-scheme: dark; }
+        body { margin: 0; padding: 26px 32px; background: #0b0b0d; color: #d8d8dc; user-select: none;
+            font: 14px/1.5 -apple-system, "Segoe UI", Cantarell, Ubuntu, sans-serif; }
+        h1 { margin: 0; font-size: 26px; letter-spacing: .14em; color: #fff; text-transform: uppercase; }
+        .sub { color: #8a8a93; margin: 2px 0 6px; }
+        h2 { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #8a8a93; margin: 18px 0 6px; }
+        ul { margin: 0; padding-left: 18px; }
+        li { margin: 2px 0; }
+        .notice { margin-top: 16px; padding: 10px 12px; border: 1px solid #5a4a1c; background: #1d1808;
+            border-radius: 8px; color: #e8d28a; }
+        .row { display: flex; gap: 10px; align-items: flex-start; margin: 5px 0; }
+        .dot { flex: none; width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; background: #555; }
+        .ok .dot { background: #4caf50; }
+        .warn .dot { background: #e0a030; }
+        .bad .dot { background: #e04a4a; }
+        .buttons { display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px; }
+        button { font: inherit; padding: 9px 18px; border-radius: 8px; border: 1px solid #3a3a42;
+            background: #1a1a1f; color: #ddd; cursor: pointer; }
+        button.primary { background: #7a1620; border-color: #a02030; color: #fff; }
+        button:disabled { opacity: .55; cursor: default; }
+        kbd { background: #1f1f25; border: 1px solid #3a3a42; border-radius: 4px; padding: 1px 6px;
+            font: 12px ui-monospace, Menlo, Consolas, monospace; }
+    </style></head>
+<body>
+<h1>Poltergeist</h1>
+<div class="sub">A harmless haunting for your desktop.</div>
+
+<h2>What it does</h2>
+<ul>
+    <li>Shakes your screen and shows fake files, folders and error boxes.</li>
+    <li>Plays sounds. Check your volume before you start.</li>
+    <li>Talks to you through a fake terminal, powered by a local AI.</li>
+    <li>Reads only your username, the time, the names of files on your Desktop and your idle time.</li>
+</ul>
+
+<h2>What it never does</h2>
+<ul>
+    <li>It never changes, moves or deletes your real files.</li>
+    <li>It never uses your camera or microphone.</li>
+    <li>It never sends anything over the internet: the AI runs on your machine.</li>
+</ul>
+
+<div class="notice">
+    Contains screen shaking and brief flashes. Do not run it if you are sensitive to flashing images.
+</div>
+
+<h2>Emergency exit, always available</h2>
+<div>Press <kbd id="key"></kbd> at any time, or type <kbd>/exit</kbd> in the terminal.</div>
+
+<h2>System check</h2>
+<div id="status"></div>
+
+<div class="buttons">
+    <button id="quit">Quit</button>
+    <button id="begin" class="primary">Begin haunting</button>
+</div>
+
+<script>
+    const $ = id => document.getElementById(id);
+    const key = ghost.platform === 'darwin' ? 'Cmd+Shift+Q' : 'Ctrl+Shift+Q';
+    $('key').textContent = key;
+
+    function row(level, text) {
+        const d = document.createElement('div');
+        d.className = 'row ' + level;
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        const t = document.createElement('span');
+        t.textContent = text;
+        d.append(dot, t);
+        return d;
+    }
+
+    function render(s) {
+        const box = $('status');
+        box.textContent = '';
+
+        // Local AI
+        if (s.ai === 'checking')      box.append(row('', 'Checking the local AI...'));
+        else if (s.ai === 'ready')    box.append(row('ok', `Local AI ready (${s.model}).`));
+        else if (s.ai === 'no-model') box.append(row('warn',
+            `Model ${s.model} not found. Run "ollama pull ${s.model}". Until then the spirit uses pre-written lines.`));
+        else                          box.append(row('warn',
+                'Ollama is not running. The spirit will use pre-written lines.'));
+
+        // Emergency exit
+        if (s.exit) box.append(row('ok', `Emergency exit active (${key}).`));
+        else box.append(row('bad',
+            'The exit shortcut could not be registered on this system. Type /exit in the terminal, ' +
+            'or stop the app from the terminal where you started it (Ctrl+C).'));
+
+        // macOS: screen recording
+        if (s.screen === 'granted') box.append(row('ok', 'Screen capture allowed: full shake effect.'));
+        else if (s.screen === 'not-determined') box.append(row('',
+            'macOS will ask for Screen Recording and Desktop access when you begin. Both are optional.'));
+        else if (s.screen) box.append(row('warn',
+            'Screen Recording is off: the shake falls back to the fake icons only. To enable it: ' +
+            'System Settings > Privacy & Security > Screen Recording, then restart.'));
+
+        // Linux: display server
+        if (s.session === 'wayland') box.append(row('warn',
+            'Wayland session detected: transparency, always-on-top and shortcuts can behave differently. X11 is the most reliable.'));
+        else if (s.session === 'x11') box.append(row('ok', 'X11 session detected.'));
+    }
+
+    async function refresh() {
+        try {
+            const s = await ghost.getStatus();
+            render(s);
+            if (s.ai === 'checking') setTimeout(refresh, 1000);
+        } catch (e) { /* the window is closing */ }
+    }
+    refresh();
+
+    $('begin').addEventListener('click', () => {
+        $('begin').disabled = true;
+        $('begin').textContent = 'Starting...';
+        ghost.begin();
+    });
+    $('quit').addEventListener('click', () => ghost.quitApp());
+</script>
+</body></html>
